@@ -905,6 +905,45 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        # Runkai's Remark #26: Dispatch tokens to experts using the dispatcher.
+        # This is the key step that routes tokens to their selected experts after top-k selection.
+        #
+        # How this dispatcher is called (for your Mixtral-8x7B --tp 8 setup):
+        # 1. Model forward pass → MoE layer forward (this function forward_impl, line 904)
+        # 2. self.dispatcher was created at line 265: self.dispatcher = create_moe_dispatcher(...)
+        # 3. create_moe_dispatcher (line 85-115) checks the all-to-all backend:
+        #    - For standard TP mode (your case): returns StandardDispatcher (line 88)
+        #    - For expert parallelism: returns MaybeTboDeepEPDispatcher or NpuFuseEPDispatcher
+        # 4. For Mixtral-8x7B with --tp 8 (no expert parallelism), dispatcher is StandardDispatcher
+        #    from srt/layers/moe/token_dispatcher/standard.py:81
+        #
+        # StandardDispatcher.dispatch() (standard.py:97-99) performs:
+        #   Input:
+        #     - hidden_states: [num_tokens, hidden_dim] - Token embeddings to route
+        #     - topk_output: StandardTopKOutput from select_experts (Remark #16)
+        #       containing topk_weights [num_tokens, 2] and topk_ids [num_tokens, 2]
+        #   Processing:
+        #     - Maps global expert IDs to local expert IDs for expert parallelism
+        #     - In standard TP mode: no expert mapping needed, experts replicated on all GPUs
+        #     - Prepares data structures for efficient expert computation
+        #   Output: StandardDispatchOutput containing:
+        #     - Reorganized hidden states grouped by expert
+        #     - Expert indices and token counts per expert
+        #     - Metadata for combining results later
+        #
+        # For Mixtral-8x7B example with 4 tokens:
+        #   Input: hidden_states [4, 4096], topk_ids [[3,7], [1,5], [2,6], [0,4]]
+        #   Output: Tokens grouped by expert for parallel processing:
+        #     Expert 0: process token 3
+        #     Expert 1: process token 1
+        #     Expert 2: process token 2
+        #     Expert 3: process token 0
+        #     Expert 4: process token 3
+        #     Expert 5: process token 1
+        #     Expert 6: process token 2
+        #     Expert 7: process token 0
+        #
+        # The dispatch_output is then used by run_moe_core (line 921) to compute expert outputs.
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
