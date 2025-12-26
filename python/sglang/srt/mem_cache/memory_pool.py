@@ -72,6 +72,12 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+# Runkai's Remark #7
+# ReqToTokenPool: Request-to-token mapping pool (Level 1 memory management)
+# Key tensor: req_to_token of shape [size, max_context_len] stores KV cache indices
+# Each row i maps request i's tokens to their physical KV cache locations
+# Example: For request with "how can I", req_to_token[req_pool_idx, 0:3] contains KV indices
+# Manages free_slots list for request pool allocation/deallocation
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -852,6 +858,13 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # Runkai's Remark #23
+    # set_kv_buffer: Writes K and V tensors to physical KV cache storage
+    # Called by: All attention backends during forward pass (decode/extend)
+    #   - FlashAttention: flashattention_backend.py:1070 (forward_decode)
+    # loc is the physical index (from out_cache_loc) where to store the KV vectors
+    # cache_k and cache_v are the computed K and V tensors for the current token
+    # Handles dtype conversion and quantization scaling if needed
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -889,6 +902,11 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
+            # Runkai's Remark #24
+            # Physical buffer write: Direct tensor indexing to store K and V at location loc
+            # k_buffer[layer_id - start_layer][loc] stores K vector for current token
+            # v_buffer[layer_id - start_layer][loc] stores V vector for current token
+            # These cached KVs will be retrieved in future attention computations (Remark #22)
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 

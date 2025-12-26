@@ -1787,6 +1787,13 @@ class ModelRunner:
             return False
         return True
 
+    # Runkai's Remark #1
+    # init_memory_pool: Main entry point for KV cache and allocator initialization
+    # Creates a three-level memory pool architecture:
+    #   Level 1: ReqToTokenPool - Maps request indices to token locations [max_num_reqs, max_context_len]
+    #   Level 2: TokenToKVPool - Physical KV cache storage (k_buffer, v_buffer per layer)
+    #   Level 3: TokenToKVPoolAllocator - Manages allocation/deallocation of KV cache indices
+    # First determines kv_cache_dtype (auto/fp8/fp4/bf16), then profiles GPU memory to find max tokens
     def init_memory_pool(
         self,
         total_gpu_memory: int,
@@ -1835,6 +1842,9 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
+        # Runkai's Remark #2
+        # profile_max_num_token: Profiles GPU memory to determine maximum number of tokens that can be cached
+        # Returns max_total_num_tokens which determines the KV cache pool size
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if (small_kv_size := envs.SGLANG_CI_SMALL_KV_SIZE.get()) > 0:
@@ -1964,6 +1974,11 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
+                # Runkai's Remark #3
+                # ReqToTokenPool: Level 1 memory pool - maps request indices to KV cache token locations
+                # Structure: req_to_token tensor of shape [max_num_reqs, max_context_len]
+                # Each row stores KV cache indices for one request's tokens
+                # Example: req_to_token[req_pool_idx, token_pos] = physical_kv_location
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
@@ -2146,6 +2161,11 @@ class ModelRunner:
                         ),
                     )
                 else:
+                    # Runkai's Remark #4
+                    # MHATokenToKVPool: Level 2 memory pool - physical KV cache storage for Multi-Head Attention
+                    # Creates k_buffer and v_buffer lists (one per layer)
+                    # Shape per layer: [max_total_num_tokens, head_num, head_dim]
+                    # Stores actual K and V vectors computed during attention
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -2196,6 +2216,11 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                     else:
+                        # Runkai's Remark #5
+                        # TokenToKVPoolAllocator: Level 3 - manages allocation of KV cache indices (page_size=1)
+                        # Maintains free_slots list of available KV cache indices (each slot stores 1 token's KV)
+                        # alloc(n) returns n contiguous free indices, free(indices) returns them to pool
+                        # Example: alloc(2) might return [1523, 1524] for storing KVs of "how" and "can"
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -2769,12 +2794,22 @@ class ModelRunner:
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    # Runkai's Remark #14
+    # forward_decode: Entry point for decode forward pass (no CUDA graph, simple decode)
+    # Processes one token per request (e.g., generating token "I" after "how can")
+    # Input: forward_batch.input_ids contains new token IDs to process
+    # Calls model.forward() which goes through transformer layers with KV cache
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Runkai's Remark #15
+        # init_forward_metadata: Prepares attention backend metadata for decode
+        # Creates KV indices mapping from req_to_token using Triton kernel
+        # Builds kv_indptr (cumulative pointers) and kv_indices (physical locations)
+        # Example: For "how can I", creates indices [loc_how, loc_can, loc_I]
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)

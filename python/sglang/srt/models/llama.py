@@ -191,9 +191,18 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Runkai's Remark #19
+        # QKV projection: Computes Query, Key, Value for current token (e.g., "I")
+        # q will query against all cached KVs ["how", "can", "I"]
+        # k and v are NEW vectors for token "I" that will be stored in KV cache
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        # Runkai's Remark #20
+        # Attention call: Performs attention computation and KV cache update
+        # Stores new k, v at cache_loc in token_to_kv_pool
+        # Retrieves all cached KVs and computes attention: Q("I") × [K("how"), K("can"), K("I")]
+        # Returns attention output weighted by values
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -335,6 +344,11 @@ class LlamaModel(nn.Module):
             deferred_norm = None
 
         aux_hidden_states = []
+        # Runkai's Remark #18
+        # Decoder layer loop: Processes token through each transformer layer
+        # Each layer performs self-attention (with KV cache) and MLP
+        # For decode of "I" after "how can": computes attention, updates KV cache, produces next hidden state
+        # hidden_states flows through layers, residual maintained for stability
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states + residual)
@@ -480,6 +494,11 @@ class LlamaForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
+                # Runkai's Remark #25
+                # Logits processing: Projects final hidden states to vocabulary logits
+                # lm_head maps hidden_states to vocabulary size (e.g., 32000 or 50000 tokens)
+                # Sampling from logits produces next token prediction (e.g., "help" after "I")
+                # Completes the decode cycle: "how can" → "I" → predict "help"
                 return self.logits_processor(
                     input_ids,
                     hidden_states,

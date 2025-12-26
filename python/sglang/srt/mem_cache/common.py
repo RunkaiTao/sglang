@@ -328,6 +328,14 @@ def alloc_req_slots(
     return req_pool_indices
 
 
+# Runkai's Remark #8
+# alloc_for_extend: Allocates KV cache for prefill/extend phase when processing new tokens
+# Called by: ScheduleBatch.prepare_for_extend() at schedule_batch.py:1442
+# Three-step allocation process:
+#   1. Allocate request slots from req_to_token_pool (maps requests to rows in pool)
+#   2. Allocate physical KV cache indices from token_to_kv_pool_allocator
+#   3. Write allocated indices to req_to_token mapping using Triton kernel
+# Example: For prefilling "how can", allocates 2 KV cache locations and maps them
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
@@ -355,6 +363,10 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
+    # Runkai's Remark #9
+    # alloc_req_slots: Step 1 - Allocate request pool slots (rows in req_to_token tensor)
+    # Returns req_pool_indices, the row indices in req_to_token_pool for this batch
+    # Each request gets a unique pool index to store its KV cache locations
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
@@ -362,6 +374,12 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
+    # Runkai's Remark #10
+    # Step 2 - Allocate physical KV cache locations from token_to_kv_pool_allocator
+    # With page_size=1: directly allocates extend_num_tokens contiguous indices (one per token)
+    # Calls allocator.alloc(extend_num_tokens) to get free KV cache slots
+    # Returns out_cache_loc: physical indices where K/V vectors will be stored
+    # Example: For "how can", might return tensor([1523, 1524]) as physical KV locations
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
@@ -381,6 +399,11 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
 
+    # Runkai's Remark #11
+    # Step 3 - Write allocated KV indices to req_to_token_pool mapping
+    # Uses Triton kernel to efficiently write out_cache_loc into req_to_token[req_pool_idx, positions]
+    # Combines prefix_indices (cached) with newly allocated out_cache_loc
+    # After this, req_to_token[req_pool_idx, i] contains physical KV location for token i
     # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
@@ -428,6 +451,13 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
+# Runkai's Remark #12
+# alloc_for_decode: Allocates KV cache for decode phase (generating one token at a time)
+# Called by: ScheduleBatch.prepare_for_decode() at schedule_batch.py:1906
+# Simpler than extend: requests already have req_pool_idx assigned
+# Retrieves last KV location from req_to_token_pool, allocates next location
+# Appends new location to req_to_token mapping at position seq_len
+# Example: After "how can" prefilled, allocating for token "I" at position 2
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
@@ -443,6 +473,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     bs = batch.seq_lens.shape[0]
 
+    # Runkai's Remark #13
+    # Allocate KV cache for decode (with page_size=1, simply allocates bs contiguous slots)
+    # Calls allocator.alloc(bs) to get one new KV cache index per request
+    # Example: For batch decoding "I" after "how can", allocates 1 new slot (e.g., index 1525)
+    # New location appended to req_to_token_pool at position seq_len
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)

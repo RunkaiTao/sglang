@@ -371,6 +371,17 @@ class FlashAttentionBackend(AttentionBackend):
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
 
+    # Runkai's Remark #16 (FlashAttention Backend)
+    # init_forward_metadata: Initializes attention metadata for decode mode
+    # WHY NEEDED: Attention kernels need batch-level information to efficiently process variable-length sequences
+    #   - Without metadata, each layer would recompute sequence lengths and memory layouts
+    #   - Metadata is computed once and reused across all transformer layers (saves overhead)
+    #   - Enables batched attention: process multiple requests with different seq_lens efficiently
+    # FlashAttention builds metadata with:
+    #   - cu_seqlens_k (cumulative sequence lengths)
+    #   - page_table (direct slice from req_to_token)
+    #   - cache_seqlens_int32 (per-request sequence lengths)
+    # Creates FlashAttentionMetadata for flash_attn_with_kvcache kernel
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -460,6 +471,11 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
+                # Runkai's Remark #17 (FlashAttention Backend)
+                # page_table assignment: Direct mapping from req_to_token to physical KV locations
+                # this directly slices req_to_token
+                # With page_size=1: each entry is a physical KV cache index
+                # Used by flash_attn_with_kvcache to fetch K/V from token_to_kv_pool buffers
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
@@ -1037,6 +1053,10 @@ class FlashAttentionBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.fa_impl_ver in [3], "Only FA3 support decoding"
+        # Runkai's Remark #21 (FlashAttention Backend)
+        # KV cache storage: Stores NEW K and V vectors for current token at cache_loc
+        # cache_loc from forward_batch.out_cache_loc (allocated by alloc_for_decode)
+        # set_kv_buffer writes to k_buffer[layer_id][cache_loc] and v_buffer[layer_id][cache_loc]
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1103,6 +1123,11 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
+            # Runkai's Remark #22 (FlashAttention Backend)
+            # Attention computation: flash_attn_with_kvcache performs efficient paged attention
+            # Q from new token attends to ALL cached KVs retrieved via get_kv_buffer
+            # get_kv_buffer returns k_buffer[layer] and v_buffer[layer] with all tokens' KVs
+            # Computes: softmax(Q × K^T / sqrt(d)) × V, returns weighted output
             # Do multi-head attention
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
