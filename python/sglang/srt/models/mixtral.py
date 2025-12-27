@@ -109,6 +109,34 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        # Runkai's Remark #0: Call TopK to select top-k experts for each token.
+        # This is THE ENTRY POINT for expert selection in Mixtral-8x7B.
+        #
+        # How this call works:
+        # 1. self.topk is a TopK instance created at line 90-93 with top_k=2, renormalize=True
+        # 2. TopK inherits from CustomOp (srt/custom_op.py:20)
+        # 3. When self.topk() is called, it invokes TopK.forward() (custom_op.py:66)
+        # 4. forward() calls self._forward_method which was set by dispatch_forward() (custom_op.py:23)
+        # 5. For CUDA GPUs: dispatch_forward() returns forward_cuda (custom_op.py:92)
+        # 6. forward_cuda dispatches to select_experts → fused_topk → topk_softmax CUDA kernel
+        #
+        # Input:
+        #   - hidden_states: [num_tokens, 4096] - Token embeddings for Mixtral-8x7B
+        #   - router_logits: [num_tokens, 8] - Router scores for 8 experts from gate network (line 111)
+        # Output:
+        #   - topk_output: StandardTopKOutput containing:
+        #       * topk_weights: [num_tokens, 2] - Normalized weights for top-2 experts
+        #       * topk_ids: [num_tokens, 2] - Expert indices (0-7)
+        #       * router_logits: [num_tokens, 8] - Original logits
+        #
+        # Call chain for expert selection:
+        #   TopK.forward (custom_op.py:66)
+        #   → TopK.forward_cuda (topk.py:273, Remark #1)
+        #   → select_experts (topk.py:855, Remark #6)
+        #   → fused_topk (topk.py:450, Remark #17)
+        #   → topk_softmax CUDA kernel (sgl_kernel/moe.py:70, Remark #25)
+        #   → CUDA implementation: sgl-kernel/csrc/moe/moe_topk_softmax_kernels.cu
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
         if self.tp_size > 1:

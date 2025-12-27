@@ -62,11 +62,67 @@ class MoeRunner:
             )
             self.fused_func = None
 
+    # Runkai's Remark #46: MoeRunner.run - Execute MoE expert computation.
+    # This is called from UnquantizedFusedMoEMethod.forward_cuda (Remark #45).
+    # This method orchestrates the MoE computation by either:
+    #   1. Using a fused function (optimized single-kernel path) - DEFAULT for Mixtral-8x7B
+    #   2. Using separate permute + runner_core + unpermute steps (multi-step path)
+    #
+    # Call chain for Mixtral-8x7B:
+    # 1. UnquantizedFusedMoEMethod.forward_cuda (unquant.py:481): self.runner.run(dispatch_output, quant_info)
+    # 2. MoeRunner.run (THIS FUNCTION): routes to self.fused_func
+    # 3. fused_experts_none_to_triton (Remark #35 in triton.py:328-357): registered via @register_fused_func
+    #
+    # Input:
+    #   - dispatch_output: StandardDispatchOutput containing:
+    #       * hidden_states: [num_tokens, hidden_dim] - Token embeddings to process
+    #       * topk_output: StandardTopKOutput with topk_weights [num_tokens, 2] and topk_ids [num_tokens, 2]
+    #   - quant_info: TritonMoeQuantInfo containing expert weights (w13_weight, w2_weight)
+    # Output:
+    #   - CombineInput (StandardCombineInput): hidden_states [num_tokens, hidden_dim] - Expert outputs weighted and combined
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
     ) -> CombineInput:
 
+        # Runkai's Remark #47: Check if fused function is available - DEFAULT PATH for Mixtral-8x7B.
+        # self.fused_func is set during __init__ (line 49-51) by calling FusedOpPool.get_fused_func.
+        # For Mixtral-8x7B with --tp 8:
+        #   - a2a_backend_name = "none" (no all-to-all communication for standard TP mode)
+        #   - runner_backend_name = "triton" (using Triton MOE backend)
+        #   - FusedOpPool.get_fused_func("none", "triton") returns fused_experts_none_to_triton
+        #
+        # fused_experts_none_to_triton is registered via decorator (triton.py:328):
+        #   @register_fused_func("none", "triton")
+        #   def fused_experts_none_to_triton(...)
+        # This decorator (base.py:212-230) adds the function to FusedOpPool._fused_funcs dict.
+        #
+        # The fused function is an optimized end-to-end kernel that combines:
+        #   - Token permutation based on expert assignment
+        #   - Expert computation (fused_moe_triton)
+        #   - Result unpermutation and weighted combination
+        # into a single efficient operation.
         if self.fused_func is not None:
+            # Runkai's Remark #48: Call the fused function directly.
+            # For Mixtral-8x7B, this calls fused_experts_none_to_triton (Remark #35).
+            #
+            # Function signature:
+            #   fused_experts_none_to_triton(
+            #       dispatch_output: StandardDispatchOutput,
+            #       quant_info: TritonMoeQuantInfo,
+            #       config: MoeRunnerConfig
+            #   ) -> StandardCombineInput
+            #
+            # Inside fused_experts_none_to_triton (triton.py:328-357):
+            # 1. Extract inputs: hidden_states, topk_weights, topk_ids
+            # 2. Permute tokens according to expert assignment (group by expert)
+            # 3. Call fused_moe_triton to compute expert outputs in batched manner
+            # 4. Un-permute results and multiply by topk_weights
+            # 5. Return StandardCombineInput with combined hidden_states
+            #
+            # Example for Mixtral-8x7B with 4 tokens:
+            # Input: hidden_states [4, 4096], topk_weights [4, 2], topk_ids [4, 2]
+            # → fused_moe_triton computes expert outputs
+            # Output: StandardCombineInput(hidden_states=[4, 4096])
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         dispatch_format = dispatch_output.format.value

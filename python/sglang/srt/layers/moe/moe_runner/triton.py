@@ -324,7 +324,21 @@ class TritonRunnerCore(MoeRunnerCore):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.TRITON
 
-
+# Quant method's apply() (e.g., UnquantizedFusedMoEMethod.apply):
+#    → MoeRunner.run (moe_runner/runner.py:65-70)
+#    → If self.fused_func is not None: return self.fused_func(dispatch_output, quant_info, self.config)
+#    → THIS FUNCTION IS CALLED (registered at line 328 via @register_fused_func)
+#
+# Registration mechanism:
+# - @register_fused_func("none", "triton") decorator at line 328
+# - Registers this function in FusedOpPool for a2a_backend="none", runner_backend="triton"
+# - Retrieved at MoeRunner.__init__ (runner.py:49): FusedOpPool.get_fused_func()
+# - Called at MoeRunner.run (runner.py:70): self.fused_func(dispatch_output, quant_info, self.config)
+#
+# For Mixtral-8x7B with --tp 8:
+# - a2a_backend="none" (no expert parallelism, standard TP mode)
+# - runner_backend="triton" (uses Triton kernels for expert computation)
+# - This function calls fused_experts (line 337) which uses Triton GEMM kernels
 @register_fused_func("none", "triton")
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,

@@ -324,6 +324,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             dispatch_output=dispatch_output,
         )
 
+    # Runkai's Remark #36: UnquantizedFusedMoEMethod.forward_cuda - Execute unquantized MoE expert computation.
+    # This is called from the quantization method's apply() which is invoked by run_moe_core (layer.py:981).
+    #
+    # Call chain for Mixtral-8x7B:
+    # 1. FusedMoE.run_moe_core (layer.py:980): self.quant_method.apply(layer, dispatch_output)
+    # 2. UnquantizedFusedMoEMethod.apply (line 319): calls self.forward(layer, dispatch_output)
+    # 3. CustomOp dispatch (custom_op.py:66): forward() → _forward_method → forward_cuda (THIS FUNCTION)
+    #
+    # Input:
+    #   - layer: FusedMoE layer instance containing expert weights (w13_weight, w2_weight)
+    #   - dispatch_output: StandardDispatchOutput from StandardDispatcher.dispatch (Remark #34) containing:
+    #       * hidden_states: [num_tokens, hidden_dim] - Token embeddings to process
+    #       * topk_output: StandardTopKOutput with topk_weights, topk_ids (from Remark #16)
+    # Output:
+    #   - CombineInput (StandardCombineInput) containing:
+    #       * hidden_states: [num_tokens, hidden_dim] - Expert outputs combined and weighted
+    #
+    # This function routes to different backends based on configuration:
+    #   - Triton kernels backend (not used by default Mixtral)
+    #   - FlashInfer CUTLASS backend
+    #   - Standard Triton MOE backend (DEFAULT for Mixtral-8x7B --tp 8)
     def forward_cuda(
         self,
         layer: torch.nn.Module,
@@ -331,17 +352,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        # Runkai's Remark #37: Extract inputs from dispatch_output.
+        # x: [num_tokens, hidden_dim] - Token embeddings from StandardDispatcher (Remark #34)
+        # topk_output: StandardTopKOutput with topk_weights [num_tokens, 2] and topk_ids [num_tokens, 2]
+        # For Mixtral-8x7B: x might be [4, 4096], topk_weights [4, 2], topk_ids [4, 2]
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
+        # Runkai's Remark #38: Check backend and dispatch to appropriate implementation.
+        # backend is determined during MoeRunner creation based on model configuration.
+        # For Mixtral-8x7B with --tp 8, backend is typically MoeRunnerBackend.TRITON (standard Triton MOE).
         backend = self.runner.runner_backend
+        # Runkai's Remark #39: Branch 1 - Triton kernels backend (uses triton_kernels routing format).
+        # This branch is NOT taken for default Mixtral-8x7B.
+        # Requires TopKOutputFormat.TRITON_KERNEL from forward_cuda (Remark #3).
+        # Uses special Triton kernel optimizations for routing.
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )
 
+            # Package expert weights and biases for Triton kernels backend
             quant_info = TritonKernelsQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -349,7 +382,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
+        # Runkai's Remark #40: Branch 2 - FlashInfer CUTLASS backend.
+        # This branch is NOT taken for default Mixtral-8x7B --tp 8.
+        # FlashInfer provides fused CUTLASS-based MOE kernels for FP16/BF16 inference.
+        # Requires self.use_flashinfer_cutlass=True (set during initialization).
         elif self.use_flashinfer_cutlass:
+            # Call FlashInfer CUTLASS fused MOE kernel
+            # Performs: for each token, compute weighted sum of selected expert outputs
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
@@ -365,7 +404,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
             return StandardCombineInput(hidden_states=output)
+        # Runkai's Remark #41: Branch 3 - Standard Triton MOE or AMD AITER backend.
+        # THIS IS THE DEFAULT PATH for Mixtral-8x7B with --tp 8.
+        # For NVIDIA GPUs: uses standard Triton MOE kernels via MoeRunner
+        # For AMD GPUs: uses AITER fused_moe (_use_aiter=True, see topk.py:72)
         else:
+            # Runkai's Remark #42: Sub-branch for AMD AITER backend.
+            # _use_aiter is False for NVIDIA GPUs, so this is SKIPPED for Mixtral-8x7B on NVIDIA.
+            # AITER provides optimized MOE kernels for AMD ROCm platform.
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
@@ -395,13 +441,43 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     expert_mask=layer.expert_mask_gpu,
                 )
                 return StandardCombineInput(hidden_states=output)
+            # Runkai's Remark #43: Standard Triton MOE backend - DEFAULT PATH for Mixtral-8x7B.
+            # This is the execution path taken for Mixtral-8x7B with --tp 8 on NVIDIA GPUs.
+            # Uses MoeRunner with standard Triton MOE kernels for expert computation.
             else:
+                # Runkai's Remark #44: Create TritonMoeQuantInfo with expert weights.
+                # For Mixtral-8x7B (unquantized):
+                #   - w13_weight: [num_experts, 2*intermediate_dim, hidden_dim] - Fused w1 and w3 weights
+                #   - w2_weight: [num_experts, hidden_dim, intermediate_dim] - w2 (down projection) weights
+                #   - b13: None (Mixtral doesn't use bias in expert layers)
+                #   - b2: None
+                # Shape example: w13_weight [8, 2*14336, 4096], w2_weight [8, 4096, 14336]
                 quant_info = TritonMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
                 )
+                # Runkai's Remark #45: Call MoeRunner.run to execute expert computation.
+                # self.runner: MoeRunner instance created during initialization (Remark #36)
+                #
+                # Call chain:
+                # 1. MoeRunner.run (moe_runner/base.py): extracts inputs, calls self.fused_func
+                # 2. self.fused_func: registered function via @register_fused_func("none", "triton")
+                # 3. fused_experts_none_to_triton (Remark #35 in moe_runner/triton.py:328-357)
+                #    - Permutes tokens according to expert assignment
+                #    - Calls fused_moe_triton for batched expert computation
+                #    - Un-permutes and combines expert outputs with topk_weights
+                #
+                # Input:
+                #   - dispatch_output: StandardDispatchOutput with hidden_states and topk_output
+                #   - quant_info: TritonMoeQuantInfo with expert weights (w13_weight, w2_weight)
+                # Output:
+                #   - StandardCombineInput(hidden_states=[num_tokens, hidden_dim])
+                #
+                # For Mixtral-8x7B example:
+                # Input: hidden_states [4, 4096], topk_weights [4, 2], topk_ids [4, 2]
+                # → fused_moe_triton computes experts → Output: hidden_states [4, 4096]
                 return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
