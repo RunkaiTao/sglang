@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_exec, get_flags
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
@@ -68,7 +68,14 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = list(server_args.cuda_graph_config.decode.bs)
+    # Honor a transient decode-bs override (set via get_context().override by the adaptive
+    # router's per-config capture) so each pre-built spec config captures ONLY its own
+    # batch-size bucket -> total graph memory stays ~one config instead of N. Unset on the
+    # normal path (None), where we use the full configured list.
+    bs_override = get_exec().graph.cuda_graph_bs_decode
+    capture_bs = list(bs_override) if bs_override else list(
+        server_args.cuda_graph_config.decode.bs
+    )
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = get_cuda_graph_batch_size_alignment(server_args)

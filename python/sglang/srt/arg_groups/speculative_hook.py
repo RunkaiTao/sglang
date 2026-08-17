@@ -769,8 +769,24 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
+        draft_pool_size,
+        is_router_table_config,
+        load_router_table,
         resolve_candidate_steps_from_config,
     )
+
+    # Static (s,t,d) router table: initialize on the WIDEST-tree config so all init-time
+    # buffers are max-sized; smaller table configs then fit the same preallocations. The
+    # router adapts all three params by batch size (topk may be >1).
+    if is_router_table_config(server_args.speculative_adaptive_config):
+        table = load_router_table(server_args.speculative_adaptive_config)
+        steps, topk, draft_tokens = max(
+            table.values(), key=lambda c: (draft_pool_size(c[0], c[1]), c[2])
+        )
+        server_args.speculative_num_steps = steps
+        server_args.speculative_eagle_topk = topk
+        server_args.speculative_num_draft_tokens = draft_tokens
+        return
 
     candidate_steps = resolve_candidate_steps_from_config(
         cfg_path=server_args.speculative_adaptive_config,

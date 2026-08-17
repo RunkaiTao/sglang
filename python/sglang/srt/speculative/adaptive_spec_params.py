@@ -56,13 +56,16 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_algorithm={server_args.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
+    # The EMA controller only supports the topk=1 chain; the static router table
+    # (StaticSpecRouter) supports topk>1 because it swaps whole per-config runtime states.
     if (
-        server_args.speculative_eagle_topk is not None
+        not is_router_table_config(server_args.speculative_adaptive_config)
+        and server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk != 1
     ):
         return (
             f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
-            "(only topk=1 is supported)"
+            "(EMA adaptive supports only topk=1; use a static router table for topk>1)"
         )
     if resolved_view(server_args).enable_dp_attention:
         return (
@@ -135,6 +138,142 @@ def resolve_candidate_steps_from_config(
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
+
+
+# ---------------------------------------------------------------------------
+# Static (s, t, d) router table — the topk>1 path.
+#
+# Instead of the EMA controller (which adapts only num_steps for the topk=1
+# chain), a router table maps each batch-size bucket to a full
+# (num_steps, eagle_topk, num_draft_tokens) config, precomputed offline. The
+# worker pre-builds one runtime state per distinct config and swaps by batch
+# size (see StaticSpecRouter). This adapts all three params at ~single-config
+# CUDA-graph memory, since each batch size is captured once.
+# ---------------------------------------------------------------------------
+_ROUTER_KEYS = ("num_steps", "eagle_topk", "num_draft_tokens")
+
+
+def draft_pool_size(num_steps: int, topk: int) -> int:
+    """Number of draft-token candidates a tree of this shape yields.
+
+    Chain (topk=1) degenerates to ``num_steps + 1``; a tree is
+    ``topk + (num_steps - 1) * topk**2``.
+    """
+    if topk == 1:
+        return num_steps + 1
+    return topk + max(0, num_steps - 1) * topk * topk
+
+
+def is_router_table_config(cfg_path: str | None) -> bool:
+    """True if the adaptive config is a static (s,t,d) router table.
+
+    Router entries carry ``num_steps`` (a full config per BS); EMA entries carry
+    ``candidate_steps``. Returns False for the None/default (EMA) config.
+    """
+    if cfg_path is None:
+        return False
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    return any(
+        key.isdigit() and isinstance(entry, dict) and "num_steps" in entry
+        for key, entry in cfg.items()
+    )
+
+
+def load_router_table(cfg_path: str) -> dict[int, tuple[int, int, int]]:
+    """Parse a static router table into ``{batch_size: (num_steps, topk, num_draft_tokens)}``.
+
+    Validates that each config's draft-token budget fits its tree pool.
+    """
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    table: dict[int, tuple[int, int, int]] = {}
+    for key, entry in cfg.items():
+        if not key.isdigit():
+            continue
+        missing = [k for k in _ROUTER_KEYS if k not in entry]
+        if missing:
+            raise ValueError(
+                f"BS {key}: router entry missing {missing}; needs {_ROUTER_KEYS}"
+            )
+        s, t, d = (
+            int(entry["num_steps"]),
+            int(entry["eagle_topk"]),
+            int(entry["num_draft_tokens"]),
+        )
+        if s < 0 or t < 1 or d < 1:
+            raise ValueError(
+                f"BS {key}: invalid (num_steps, eagle_topk, num_draft_tokens)="
+                f"({s}, {t}, {d})"
+            )
+        pool = draft_pool_size(s, t)
+        if d > pool:
+            raise ValueError(
+                f"BS {key}: num_draft_tokens={d} exceeds tree pool {pool} "
+                f"(= topk + (num_steps-1)*topk**2) for num_steps={s}, topk={t}"
+            )
+        table[int(key)] = (s, t, d)
+
+    if not table:
+        raise ValueError(
+            "router table must contain at least one integer-string BS key, e.g. "
+            '{"1": {"num_steps": 4, "eagle_topk": 10, "num_draft_tokens": 32}}. '
+            f"Got keys: {list(cfg.keys())}"
+        )
+    return table
+
+
+class StaticSpecTable:
+    """Routes ``batch_size`` → ``(num_steps, eagle_topk, num_draft_tokens)`` via a
+    static lookup table (mirrors ``AdaptiveSpeculativeParams``' BS bucketing)."""
+
+    def __init__(self, cfg_path: str):
+        self._table = load_router_table(cfg_path)
+        self._bs_list: list[int] = sorted(self._table)
+        self._cuda_graph_bs: list[int] | None = None
+
+    def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
+
+    @property
+    def configs(self) -> list[tuple[int, int, int]]:
+        """Distinct (s, t, d) configs, in ascending-BS order (deduplicated)."""
+        seen: list[tuple[int, int, int]] = []
+        for bs in self._bs_list:
+            cfg = self._table[bs]
+            if cfg not in seen:
+                seen.append(cfg)
+        return seen
+
+    def get_config_for_batch(self, batch_size: int) -> tuple[int, int, int]:
+        return self._table[
+            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+        ]
+
+    def cuda_graph_bs_for_config(
+        self, config: tuple[int, int, int]
+    ) -> list[int] | None:
+        """CUDA-graph batch sizes that route to *config* (None when graphs disabled)."""
+        if self._cuda_graph_bs is None:
+            return None
+        return [
+            v
+            for v in self._cuda_graph_bs
+            if self._table[self._find_closest_bs(v)] == config
+        ]
+
+    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
+        if self._cuda_graph_bs is None:
+            return batch_size
+        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
+        return (
+            self._cuda_graph_bs[idx] if idx < len(self._cuda_graph_bs) else batch_size
+        )
+
+    def _find_closest_bs(self, target: int) -> int:
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
 
 
 class AdaptiveStepSlot:

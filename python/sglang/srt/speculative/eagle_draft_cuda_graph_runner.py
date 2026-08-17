@@ -38,7 +38,6 @@ from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -124,7 +123,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        # Read topk from the resolved spec context (like speculative_num_steps above), NOT
+        # the pristine server_args: adaptive/router capture overrides topk via
+        # get_context().override, and reading server_args here would ignore it (the wrapper
+        # would be fixed at the init topk and mismatch a smaller-topk config's kv-indices).
+        self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
@@ -146,10 +149,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-        # Static capture width.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_decode", server_args=model_runner.server_args
-        )
+        # Static capture width == draft-decode per-request width == topk (from the resolved
+        # context above, so adaptive/router topk overrides are honored).
+        self.captured_req_width = self.topk
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 

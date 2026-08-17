@@ -29,6 +29,7 @@ class SpecRuntimeState:
     # -- Configuration (determines shapes for all stages) --
     speculative_num_steps: int
     speculative_num_draft_tokens: int
+    topk: int
 
     # -- Draft stage: draft model multi-step autoregressive generation --
     draft_attn_backend: "AttentionBackend | None"
@@ -44,14 +45,17 @@ class SpecRuntimeState:
 
 
 class AdaptiveSpecWorker(Protocol):
-    """Protocol that a worker must implement to use AdaptiveController."""
+    """Protocol that a worker must implement to use AdaptiveController / StaticSpecRouter."""
 
     speculative_num_steps: int
+    speculative_num_draft_tokens: int
+    topk: int
 
     def build_adaptive_runtime_state(
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
+        topk: int | None = None,
         cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState: ...
 
@@ -131,4 +135,82 @@ class AdaptiveController:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
+        self.worker.apply_runtime_state(state)
+
+
+class StaticSpecRouter:
+    """Switches the full ``(num_steps, eagle_topk, num_draft_tokens)`` config by batch
+    size from a precomputed static table — no acceptance-EMA search.
+
+    Drop-in for AdaptiveController in the worker's ``adaptive_controller`` slot: it exposes
+    ``register`` / ``init_states`` / ``activate_step_by_batch`` / ``on_verify_complete`` with
+    the same signatures the worker calls. Unlike the EMA controller (which adapts only
+    num_steps for the topk=1 chain), the router pre-builds one runtime state per distinct
+    table config and adapts all three params. Because each batch size maps to exactly one
+    config, CUDA graphs are captured once per batch size → ~single-config graph memory.
+    """
+
+    def __init__(self, worker: AdaptiveSpecWorker, config_path: str):
+        from sglang.srt.speculative.adaptive_spec_params import StaticSpecTable
+
+        self.worker = worker
+        self.table = StaticSpecTable(config_path)
+        self._states: dict[tuple[int, int, int], SpecRuntimeState] = {}
+
+    @staticmethod
+    def _key(state: SpecRuntimeState) -> tuple[int, int, int]:
+        return (
+            state.speculative_num_steps,
+            state.topk,
+            state.speculative_num_draft_tokens,
+        )
+
+    def _worker_config(self) -> tuple[int, int, int]:
+        return (
+            self.worker.speculative_num_steps,
+            self.worker.topk,
+            self.worker.speculative_num_draft_tokens,
+        )
+
+    def register(
+        self, state: SpecRuntimeState, config: tuple[int, int, int] | None = None
+    ) -> None:
+        """Register a pre-built runtime state (e.g. the initial captured state)."""
+        self._states[config if config is not None else self._key(state)] = state
+
+    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
+        """Build and register a runtime state for every distinct table config."""
+        self.table.set_cuda_graph_bs(cuda_graph_bs)
+
+        for (steps, topk, draft_tokens) in self.table.configs:
+            if (steps, topk, draft_tokens) in self._states:
+                continue
+            pruned_bs = self.table.cuda_graph_bs_for_config((steps, topk, draft_tokens))
+            state = self.worker.build_adaptive_runtime_state(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=draft_tokens,
+                topk=topk,
+                cuda_graph_bs=pruned_bs,
+            )
+            self._states[(steps, topk, draft_tokens)] = state
+
+        # Start on the config matching the worker's initial settings.
+        if self._worker_config() in self._states:
+            self._activate(self._worker_config())
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        target = self.table.get_config_for_batch(batch_size)
+        if target != self._worker_config():
+            self._activate(target)
+
+    def on_verify_complete(
+        self, num_correct_drafts_per_req: list[int], batch_size: int
+    ) -> None:
+        """Static router does no runtime learning; verify results are ignored."""
+        return None
+
+    def _activate(self, config: tuple[int, int, int]) -> None:
+        state = self._states.get(config)
+        if state is None:
+            raise ValueError(f"Missing router runtime state for config {config}")
         self.worker.apply_runtime_state(state)

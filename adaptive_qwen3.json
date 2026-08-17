@@ -1,0 +1,8 @@
+{
+  "_comment": "Static (s,t,d) router table for Qwen3-8B-vega EAGLE3, from eagle3_brute_best_by_c.json. Keys are the LOWER edge of each batch-size bucket; routing picks the largest key <= live batch size. Each entry is the brute-force-optimal (num_steps, eagle_topk, num_draft_tokens) for that concurrency range.",
+  "1":  {"num_steps": 4, "eagle_topk": 10, "num_draft_tokens": 32},
+  "3":  {"num_steps": 4, "eagle_topk": 8,  "num_draft_tokens": 32},
+  "5":  {"num_steps": 3, "eagle_topk": 7,  "num_draft_tokens": 16},
+  "9":  {"num_steps": 3, "eagle_topk": 3,  "num_draft_tokens": 8},
+  "17": {"num_steps": 3, "eagle_topk": 1,  "num_draft_tokens": 4}
+}

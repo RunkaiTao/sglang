@@ -54,6 +54,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    StaticSpecRouter,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -123,6 +124,43 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _resolve_max_topk(server_args) -> int:
+    """The largest topk this worker may ever run. For the static router that's the max
+    topk across the table (the cross-step draft seed is always produced at this width so
+    persistent seed buffers stay a fixed max size); otherwise it's the single topk."""
+    topk = server_args.speculative_eagle_topk or 1
+    if server_args.speculative_adaptive:
+        from sglang.srt.speculative.adaptive_spec_params import (
+            is_router_table_config,
+            load_router_table,
+        )
+
+        if is_router_table_config(server_args.speculative_adaptive_config):
+            table = load_router_table(server_args.speculative_adaptive_config)
+            return max(t for (_, t, _) in table.values())
+    return topk
+
+
+def _fit_topk_width(t: torch.Tensor, width: int) -> torch.Tensor:
+    """Resize a ``(bs, k)`` draft-seed tensor to ``width`` along dim -1.
+
+    Slice its top prefix when wider, pad by repeating the last column when narrower.
+    Used by the adaptive router (StaticSpecRouter): when it switches topk between decode
+    steps, the seed carried from the previous step keeps the old width, so it must be
+    fit to the newly-active config's topk before the draft graph/eager path consumes it.
+    Shrinking keeps the true top-`width` (fast_topk output is prob-sorted); growing repeats
+    the last candidate for the one transition step (those extra branches are simply rejected
+    by verify -- lossless). No-op when widths already match.
+    """
+    cur = t.shape[-1]
+    if cur == width:
+        return t
+    if cur > width:
+        return t[..., :width].contiguous()
+    pad = t[..., -1:].expand(*t.shape[:-1], width - cur)
+    return torch.cat([t, pad], dim=-1).contiguous()
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -142,6 +180,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Args for easy access
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
+        # Constant max topk (unaffected by adaptive topk swaps); the cross-step seed is
+        # always produced at this width so persistent seed buffers keep a fixed size.
+        self.max_topk = _resolve_max_topk(server_args)
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -462,6 +503,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
+        # The adaptive router may have switched topk since the seed was produced last
+        # step; fit the carried seed to this config's topk (slice/pad) so both the CUDA
+        # graph and eager draft paths see the expected (bs, topk) width. No-op otherwise.
+        if (
+            draft_input.topk_p is not None
+            and draft_input.topk_p.shape[-1] != self.topk
+        ):
+            draft_input.topk_p = _fit_topk_width(draft_input.topk_p, self.topk)
+            draft_input.topk_index = _fit_topk_width(draft_input.topk_index, self.topk)
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -804,7 +854,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if use_rejection_sampling:
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # Cross-step seed after prefill: emit at max_topk so the persistent seed
+            # buffers (FutureMap) stay a fixed width across adaptive topk switches; the
+            # first decode's draft() slices it to the active config's topk.
+            topk_p, topk_index = fast_topk(probs, self.max_topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -960,7 +1013,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info,
                 get_spec().speculative_use_rejection_sampling,
             )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            # Emit the cross-step seed at max_topk (not the active config's topk) so
+            # persistent seed buffers (future_map, next draft input) keep a fixed width;
+            # each draft graph slices it down to its own topk in draft(). No-op when the
+            # topk is static (max_topk == topk).
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.max_topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
 
@@ -993,6 +1050,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Parse arguments
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
+        # Constant max topk across adaptive configs; see EagleDraftWorker.max_topk.
+        self.max_topk = _resolve_max_topk(server_args)
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.ps = ps
@@ -1012,13 +1071,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
-        # Adaptive speculative
-        self.adaptive_controller: Optional[AdaptiveController] = None
+        # Adaptive speculative: either the EMA controller (adapts num_steps, topk=1
+        # chain) or the static (s,t,d) router table (adapts all three, topk>=1).
+        self.adaptive_controller: Optional[
+            AdaptiveController | StaticSpecRouter
+        ] = None
         if server_args.speculative_adaptive:
-            self.adaptive_controller = AdaptiveController(
-                self,
-                config_path=server_args.speculative_adaptive_config,
+            from sglang.srt.speculative.adaptive_spec_params import (
+                is_router_table_config,
             )
+
+            if is_router_table_config(server_args.speculative_adaptive_config):
+                self.adaptive_controller = StaticSpecRouter(
+                    self,
+                    config_path=server_args.speculative_adaptive_config,
+                )
+            else:
+                self.adaptive_controller = AdaptiveController(
+                    self,
+                    config_path=server_args.speculative_adaptive_config,
+                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1045,8 +1117,41 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self._draft_worker.draft_runner.attn_backend,
         )
 
+    @contextlib.contextmanager
+    def _scoped_decode_bs(self, cuda_graph_bs):
+        """Temporarily override the decode capture batch-size list (read by
+        get_batch_sizes_to_capture) and restore it, mirroring _override_worker_state."""
+        backup = get_exec().graph.cuda_graph_bs_decode
+        get_context().override(
+            "router.initial_capture", cuda_graph_bs_decode=cuda_graph_bs
+        )
+        try:
+            yield
+        finally:
+            get_context().override(
+                "router.initial_capture_restore", cuda_graph_bs_decode=backup
+            )
+
     def init_cuda_graphs(self):
-        super().init_cuda_graphs()
+        router = self.adaptive_controller
+        # Static router: prune the initial/startup config's capture to its own batch-size
+        # bucket too (not the full list), so EVERY config captures only the sizes it serves.
+        if isinstance(router, StaticSpecRouter) and not check_cuda_graph_backend(
+            Phase.DECODE, Backend.DISABLED
+        ):
+            router.table.set_cuda_graph_bs(
+                list(self.server_args.cuda_graph_config.decode.bs)
+            )
+            init_bucket = router.table.cuda_graph_bs_for_config(
+                (self.speculative_num_steps, self.topk, self.speculative_num_draft_tokens)
+            )
+            if init_bucket:
+                with self._scoped_decode_bs(init_bucket):
+                    super().init_cuda_graphs()
+            else:
+                super().init_cuda_graphs()
+        else:
+            super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1060,6 +1165,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     SpecRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        topk=self.topk,
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
@@ -1068,13 +1174,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+                if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                    init_cuda_graph_bs = None
+                elif isinstance(self.adaptive_controller, StaticSpecRouter):
+                    # Router: pass the ACTUAL decode capture list (get_exec()...bs_decode is
+                    # None by default) so each config's states are built with only its own
+                    # batch-size bucket -> total graph memory stays ~one config, not N.
+                    init_cuda_graph_bs = list(
+                        self.server_args.cuda_graph_config.decode.bs
+                    )
+                else:
+                    # EMA controller: unchanged behavior.
+                    init_cuda_graph_bs = get_exec().graph.cuda_graph_bs_decode
+                self.adaptive_controller.init_states(cuda_graph_bs=init_cuda_graph_bs)
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
@@ -1131,7 +1243,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     device=self.device,
                     hidden_size=hidden_size,
                     dtype=hidden_dtype,
-                    topk=self.topk,
+                    # max_topk so an idle seed that gets stashed matches the fixed-width
+                    # FutureMap buffers; draft() slices to the active topk.
+                    topk=self.max_topk,
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
@@ -1242,11 +1356,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input: EagleDraftInput = batch_output.next_draft_input
         bs = batch.seq_lens.shape[0]
         device = self.device
+        # max_topk width (not the active config's topk): the FutureMap stashes these at a
+        # fixed max width; draft() slices to the active topk on any later upshift.
         next_draft_input.topk_p = torch.zeros(
-            (bs, self.topk), dtype=torch.float32, device=device
+            (bs, self.max_topk), dtype=torch.float32, device=device
         )
         next_draft_input.topk_index = torch.zeros(
-            (bs, self.topk), dtype=torch.int64, device=device
+            (bs, self.max_topk), dtype=torch.int64, device=device
         )
         hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
             self.draft_worker.draft_runner
@@ -1276,15 +1392,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
+        topk: int | None = None,
         cuda_graph_bs=None,
     ) -> SpecRuntimeState:
-        """Build a SpecRuntimeState for the given step configuration."""
+        """Build a SpecRuntimeState for the given (steps, topk, draft_tokens) config.
+
+        *topk* defaults to the worker's current topk (the EMA controller keeps topk fixed);
+        the static router passes a per-config topk.
+        """
+        if topk is None:
+            topk = self.topk
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
             speculative_num_steps,
             speculative_num_draft_tokens,
+            topk=topk,
             cuda_graph_bs=cuda_graph_bs,
         ):
             self._draft_worker.init_attention_backend()
@@ -1315,6 +1439,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             state = SpecRuntimeState(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+                topk=topk,
                 draft_attn_backend=self._draft_worker.draft_attn_backend,
                 cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                 target_attn_backend=target_attn_backend,
@@ -1335,13 +1460,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""
-        if self.speculative_num_steps == state.speculative_num_steps:
+        # Compare the FULL config, not just steps: the static router may hold configs
+        # that share num_steps but differ in topk / num_draft_tokens (e.g. (4,10,32)
+        # vs (4,8,32)), which must still trigger a swap.
+        if (
+            self.speculative_num_steps == state.speculative_num_steps
+            and self.speculative_num_draft_tokens == state.speculative_num_draft_tokens
+            and self.topk == state.topk
+        ):
             return
 
         log_info_on_rank0(
             logger,
             "Switch adaptive runtime state: "
             f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"topk {self.topk} -> {state.topk}, "
             f"draft_tokens {self.speculative_num_draft_tokens} -> "
             f"{state.speculative_num_draft_tokens}",
         )
@@ -1349,11 +1482,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Top-level
         self.speculative_num_steps = state.speculative_num_steps
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        self.topk = state.topk
 
         # Draft side
         dw = self._draft_worker
         dw.speculative_num_steps = state.speculative_num_steps
         dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.topk = state.topk
         dw.draft_attn_backend = state.draft_attn_backend
         dw.draft_runner.draft_attn_backend = state.draft_attn_backend
         dw.cuda_graph_runner = state.cuda_graph_runner
@@ -1378,6 +1513,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             "adaptive_spec.restore",
             speculative_num_steps=state.speculative_num_steps,
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
+            speculative_eagle_topk=state.topk,
         )
 
     @contextlib.contextmanager
@@ -1385,9 +1521,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
+        topk: int | None = None,
         cuda_graph_bs: list[int] | None = None,
     ):
-        """Temporarily override server_args and worker attributes for graph capture."""
+        """Temporarily override server_args and worker attributes for graph capture.
+
+        *topk* defaults to the current worker topk (EMA path keeps it fixed); the static
+        router passes a per-config topk so the captured tree matches that config's width.
+        """
+        if topk is None:
+            topk = self.topk
         dw = self._draft_worker
         backup = (
             self.speculative_num_steps,
@@ -1404,16 +1547,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_num_draft_tokens,
             get_exec().graph.cuda_graph_bs_decode,
             get_exec().graph.disable_cuda_graph,
+            self.topk,
+            dw.topk,
+            get_spec().speculative_eagle_topk,
         )
 
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.topk = topk
         dw.speculative_num_steps = speculative_num_steps
         dw.speculative_num_draft_tokens = speculative_num_draft_tokens
+        dw.topk = topk
+        # The draft-decode CUDA graph runner reads its per-request width (topk) from the
+        # resolved spec context (get_spec().speculative_eagle_topk), so overriding it here is
+        # what makes each config's wrapper size to that config's topk (bs*topk rows).
         get_context().override(
             "adaptive_spec.capture_override",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=topk,
         )
         if cuda_graph_bs is not None:
             # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
@@ -1442,12 +1594,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
             ) = backup[:10]
+            self.topk = backup[14]
+            dw.topk = backup[15]
             get_context().override(
                 "adaptive_spec.capture_restore",
                 speculative_num_steps=backup[10],
                 speculative_num_draft_tokens=backup[11],
                 cuda_graph_bs_decode=backup[12],
                 disable_cuda_graph=backup[13],
+                speculative_eagle_topk=backup[16],
             )
             dw._rebuild_topk1_chain_buffers()
 

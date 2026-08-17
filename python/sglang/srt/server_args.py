@@ -8486,14 +8486,21 @@ class ServerArgs:
             return self.speculative_num_draft_tokens
 
         from sglang.srt.speculative.adaptive_spec_params import (
+            is_router_table_config,
+            load_router_table,
             resolve_candidate_steps_from_config,
         )
+
+        # Static (s,t,d) router table (topk>=1): num_draft_tokens is fixed per config, so
+        # shared buffers are sized for the largest draft-token budget in the table.
+        if is_router_table_config(self.speculative_adaptive_config):
+            table = load_router_table(self.speculative_adaptive_config)
+            return max(d for (_, _, d) in table.values())
 
         candidate_steps = resolve_candidate_steps_from_config(
             cfg_path=self.speculative_adaptive_config,
         )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+        # EMA adaptive (topk=1 chain): each runtime state needs steps + 1 draft-token slots.
         return max(candidate_steps) + 1
 
     @property
