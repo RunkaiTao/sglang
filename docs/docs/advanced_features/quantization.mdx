@@ -200,7 +200,7 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection applies to **blockwise FP8**, **channelwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
 ### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
@@ -260,6 +260,8 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM120); 4) AITER (AMD); 5) Triton (fallback).
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
+
+**Channelwise FP8 (per-token x per-channel):** `--fp8-gemm-backend triton` also routes channelwise FP8 linear layers to Triton, not just the blockwise path above. Under `auto`, channelwise stays on CUTLASS except where a tuned Triton tile exists for the GPU and weight shape (`python/sglang/kernels/ops/quantization/configs/*dtype=fp8_w8a8_channelwise.json`, currently L40S and RTX PRO 4500 Blackwell) -- the table only holds shapes where Triton measured faster. Set `SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0` to ignore the table, or `SGLANG_ENABLE_FP8_GEMM_TMA=0` to keep the tuned tile but load through pointer arithmetic instead of TMA descriptors.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 

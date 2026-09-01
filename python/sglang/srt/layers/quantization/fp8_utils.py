@@ -817,6 +817,20 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     return FP8_GEMM_RUNNER_BACKEND
 
 
+def force_triton_channelwise_fp8() -> bool:
+    """Whether a channelwise FP8 linear must run on Triton even with no tuned tile.
+
+    `--fp8-gemm-backend triton` (or the legacy USE_TRITON_W8A8_FP8_KERNEL) opts
+    into Triton for every shape, falling back to the heuristic tile where the
+    shape was never tuned. Left alone, the choice stays per-shape: the tuned
+    table only has entries where Triton beat CUTLASS on this GPU, so CUTLASS
+    keeps everything else. Note `auto` is rewritten to `cutlass` on sm_120 by
+    `initialize_fp8_gemm_config`, so an explicit `--fp8-gemm-backend cutlass`
+    there is indistinguishable from `auto` and does not suppress the table.
+    """
+    return use_triton_w8a8_fp8_kernel or get_fp8_gemm_runner_backend().is_triton()
+
+
 def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1844,13 +1858,17 @@ def apply_fp8_linear(
     )
     cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
     use_cutlass_channelwise_gemm = (
-        channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
+        channelwise_cutlass
+        and cutlass_compatible_b
+        and not force_triton_channelwise_fp8()
     )
-    # Consider a tuned Triton tile only where the shape would otherwise go to
-    # CUTLASS (that is the path the offline sweep tuned against). On by default;
+    # Consider a tuned Triton tile only where CUTLASS is a candidate at all, since
+    # that is the path the offline sweep tuned against. On by default;
     # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
     use_tuned_triton_channelwise = (
-        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+        channelwise_cutlass
+        and cutlass_compatible_b
+        and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
     )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
@@ -1942,13 +1960,7 @@ def apply_fp8_linear(
             if use_tuned_triton_channelwise
             else None
         )
-        if not use_cutlass_channelwise_gemm:
-            # Massage the input to be 2D
-            qinput = qinput.view(-1, qinput.shape[-1])
-            output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, output_dtype, bias
-            )
-        elif tuned_config is not None:
+        if tuned_config is not None:
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
                 qinput,
@@ -1963,6 +1975,15 @@ def apply_fp8_linear(
                 use_heuristic=False,
                 num_warps=tuned_config["num_warps"],
                 num_stages=tuned_config["num_stages"],
+                # Older config files predate both keys.
+                group_size_m=tuned_config.get("GROUP_SIZE_M", 1),
+                use_tma=tuned_config.get("use_tma", False),
+            )
+        elif not use_cutlass_channelwise_gemm:
+            # Massage the input to be 2D
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput, weight, x_scale, weight_scale, output_dtype, bias
             )
         else:
             output = fp8_scaled_mm(

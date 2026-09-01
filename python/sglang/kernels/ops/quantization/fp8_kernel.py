@@ -25,7 +25,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
@@ -1387,6 +1389,11 @@ def get_w8a8_channelwise_fp8_configs(N: int, K: int) -> Optional[Dict[int, Any]]
     grid keeps the point (to stop a neighbouring M snapping onto it) but the
     caller must fall back. A missing file / shape likewise means "keep the
     default".
+
+    An entry carries BLOCK_SIZE_M / BLOCK_SIZE_N / BLOCK_SIZE_K / num_warps /
+    num_stages, plus two optional keys that older files predate: GROUP_SIZE_M
+    (defaults to 1, plain row-major program order) and use_tma (defaults to
+    false). Both are passed straight to `triton_scaled_mm`.
     """
     # Intentional: the tuned lookup (host-side device name + file I/O) isn't
     # traceable, so under torch.compile return None and fall back to CUTLASS --
@@ -2157,6 +2164,34 @@ def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
 
 
 @triton.jit
+def _grouped_pid(
+    pid,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Map a 1-D program id to (pid_m, pid_n), walking GROUP_SIZE_M rows at a time.
+
+    Consecutive programs cover a GROUP_SIZE_M x num_pid_n patch instead of a
+    whole output row, so the B tiles a patch reads stay resident in L2.
+    GROUP_SIZE_M == 1 folds back to plain row-major: num_pid_in_group becomes
+    num_pid_n and group_size_m becomes 1, leaving pid_m = pid // num_pid_n and
+    pid_n = pid % num_pid_n.
+    """
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
 def scaled_mm_kernel(
     a_ptr,
     b_ptr,
@@ -2179,13 +2214,11 @@ def scaled_mm_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_A: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    pid_m, pid_n = _grouped_pid(
+        tl.program_id(axis=0), M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
 
     accumulator_dtype = ACCUMULATOR_DTYPE
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
@@ -2277,6 +2310,126 @@ def scaled_mm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _HAS_TRITON_TMA = True
+except ImportError:
+    TensorDescriptor = None
+    _HAS_TRITON_TMA = False
+
+
+def _tma_channelwise_usable(
+    input: torch.Tensor, weight: torch.Tensor, block_size_k: int
+) -> bool:
+    """Whether this launch can use `scaled_mm_kernel_tma` instead of `scaled_mm_kernel`.
+
+    A False answer is never an error: the caller runs the pointer-load kernel
+    with the same tile, so a tuned config asking for TMA on a machine or a shape
+    that cannot do it degrades to the swizzle-only kernel.
+    """
+    if not _HAS_TRITON_TMA or not envs.SGLANG_ENABLE_FP8_GEMM_TMA.get():
+        return False
+    platform = get_platform()
+    # TMA is SM90+; the sm helpers match on the major, so enumerate the majors
+    # that have it (9 = Hopper, 10/11/12 = Blackwell) rather than compare.
+    if not (platform.is_sm90 or platform.is_blackwell):
+        return False
+    # Descriptors need the innermost dim contiguous. A is read as [M, K] and B as
+    # its [N, K] transpose, so B must be the column-major layout that
+    # process_weights_after_loading produces; is_weak_contiguous admits both.
+    if input.stride(1) != 1 or weight.stride(0) != 1:
+        return False
+    # Hardware constraint: TMA needs 16B-aligned box and row strides. fp8 is 1
+    # byte per element, so K is both tensors' row stride in bytes.
+    return input.shape[1] % 16 == 0 and block_size_k % 16 == 0
+
+
+@triton.jit
+def scaled_mm_kernel_tma(
+    desc_a,
+    desc_b_t,
+    scale_a_ptr,
+    scale_b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_cm,
+    stride_cn,
+    ACCUMULATOR_DTYPE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_SCALE_A: tl.constexpr,
+    BLOCK_SIZE_SCALE_B: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """`scaled_mm_kernel` with the A/B tiles loaded through TMA descriptors.
+
+    desc_a describes A as [M, K]; desc_b_t describes B as the [N, K] transpose of
+    the [K, N] weight, which is a view rather than a copy when the weight is
+    column-major. Everything after the K loop is identical to `scaled_mm_kernel`.
+    """
+    pid_m, pid_n = _grouped_pid(
+        tl.program_id(axis=0), M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    accumulator_dtype = ACCUMULATOR_DTYPE
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
+
+    # No K mask: TMA zero-pads an out-of-bounds tile in hardware, and a zero
+    # operand contributes nothing to the dot.
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = desc_a.load([pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K])
+        # [BLOCK_SIZE_N, BLOCK_SIZE_K] out of the transposed view, so transpose
+        # back to the [BLOCK_SIZE_K, BLOCK_SIZE_N] tl.dot wants.
+        b = tl.trans(desc_b_t.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]))
+
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+
+    offsets_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+
+    offsets_scale_am = (
+        tl.arange(0, BLOCK_SIZE_SCALE_A)
+        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
+    )
+    masks_scale_am = offsets_scale_am < M
+
+    offsets_scale_bn = (
+        tl.arange(0, BLOCK_SIZE_SCALE_B)
+        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
+    )
+    masks_scale_bn = offsets_scale_bn < N
+
+    scale_a_ptrs = scale_a_ptr + offsets_scale_am
+    scale_b_ptrs = scale_b_ptr + offsets_scale_bn
+
+    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
+    scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
+    scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+    accumulator = scale_a * accumulator.to(tl.float32)
+
+    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
+    scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+    scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+    accumulator = scale_b.T * accumulator.to(tl.float32)
+
+    c = accumulator.to(c_ptr.type.element_ty)
+
+    if bias_ptr:
+        bias_ptrs = bias_ptr + offsets_bn
+        bias = tl.load(bias_ptrs, offsets_bn < N)
+        c += bias
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offsets_bn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offsets_bn[None, :] < N)
+
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
 # input  - [M, K]
 # weight - [K, N]
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
@@ -2293,6 +2446,8 @@ def triton_scaled_mm(
     use_heuristic=True,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    group_size_m: int = 1,
+    use_tma: bool = False,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -2351,29 +2506,55 @@ def triton_scaled_mm(
 
     # A = input, B = weight, C = result
     # A = M x K, B = K x N, C = M x N
-    scaled_mm_kernel[grid](
-        input,
-        weight,
-        scale_a,
-        scale_b,
-        result,
-        bias,
-        M,
-        N,
-        K,
-        input.stride(0),
-        input.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        result.stride(0),
-        result.stride(1),
-        accumulator_dtype,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        BLOCK_SIZE_SCALE_A=block_size_sa,
-        BLOCK_SIZE_SCALE_B=block_size_sb,
-        **launch_kwargs,
-    )
+    if use_tma and _tma_channelwise_usable(
+        input=input, weight=weight, block_size_k=block_size_k
+    ):
+        scaled_mm_kernel_tma[grid](
+            TensorDescriptor.from_tensor(input, [block_size_m, block_size_k]),
+            TensorDescriptor.from_tensor(weight.T, [block_size_n, block_size_k]),
+            scale_a,
+            scale_b,
+            result,
+            bias,
+            M,
+            N,
+            K,
+            result.stride(0),
+            result.stride(1),
+            accumulator_dtype,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            BLOCK_SIZE_SCALE_A=block_size_sa,
+            BLOCK_SIZE_SCALE_B=block_size_sb,
+            GROUP_SIZE_M=group_size_m,
+            **launch_kwargs,
+        )
+    else:
+        scaled_mm_kernel[grid](
+            input,
+            weight,
+            scale_a,
+            scale_b,
+            result,
+            bias,
+            M,
+            N,
+            K,
+            input.stride(0),
+            input.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            result.stride(0),
+            result.stride(1),
+            accumulator_dtype,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            BLOCK_SIZE_SCALE_A=block_size_sa,
+            BLOCK_SIZE_SCALE_B=block_size_sb,
+            GROUP_SIZE_M=group_size_m,
+            **launch_kwargs,
+        )
 
     return result.to(out_dtype)

@@ -932,6 +932,11 @@ class Envs:
     # Blackwell), so it is a no-op on any other GPU / untuned shape even when
     # enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
+    # On by default; set SGLANG_ENABLE_FP8_GEMM_TMA=0 as a kill switch. A tuned
+    # channelwise config may carry "use_tma": true, which loads the A/B tiles
+    # through TMA descriptors instead of pointer arithmetic. Disabling it keeps
+    # the same tile and GROUP_SIZE_M and only changes how the bytes are fetched.
+    SGLANG_ENABLE_FP8_GEMM_TMA = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
