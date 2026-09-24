@@ -53,6 +53,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_token_map import (
+    DFlashTokenMapHead,
+    load_dflash_token_map,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -113,7 +117,10 @@ class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+    A token map delegates to DFlashTokenMapHead, whose compact IDs and
+    tie order follow the map file.
 
+    Without a token map:
     tp=1: plain argmax over the local (full) vocab shard.
     tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
     Tie resolution is bit-exact vs a full-vocab argmax: ranks own contiguous
@@ -122,13 +129,22 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        token_map_head=None,
     ):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
+        self.token_map_head = token_map_head
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
@@ -160,9 +176,12 @@ class _DflashDraftSampler:
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
         )
+        n = hs.shape[0]
+        if self.token_map_head is not None:
+            self.out[:n].copy_(self.token_map_head.greedy(hs, self.tp_group))
+            return
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
-        n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
@@ -423,6 +442,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
+        self._draft_token_map_head = None
+        self._init_draft_token_map()
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -562,6 +583,46 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _init_draft_token_map(self):
+        token_map_path = get_spec().speculative_token_map
+        if token_map_path is None:
+            return
+        if self.selector is not None or self._is_domino:
+            raise ValueError(
+                "DFLASH --speculative-token-map currently supports the standard "
+                "DFlash draft, without a selector or Domino projector."
+            )
+        target_model = self.target_worker.model_runner.model
+        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
+            tp_group = get_tp_group()
+        self._draft_token_map_head = DFlashTokenMapHead(
+            lm_head,
+            load_dflash_token_map(token_map_path),
+            vocab_size=self.model_runner.model_config.vocab_size,
+            tp_group=tp_group,
+            use_fp32=getattr(
+                getattr(target_model, "logits_processor", None),
+                "use_fp32_lm_head",
+                False,
+            ),
+        )
+        head = self._draft_token_map_head
+        logger.info(
+            "DFLASH draft token map enabled: vocab=%d/%d, local_rows=%d, "
+            "head_memory=%.2f MiB, path=%s",
+            head.vocab_size,
+            self.model_runner.model_config.vocab_size,
+            head.weight.shape[0],
+            head.nbytes / (1024 * 1024),
+            token_map_path,
+        )
+
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        head = self._draft_token_map_head
+        return super().preloaded_weights_bytes + (head.nbytes if head else 0)
 
     @property
     def draft_worker(self):
@@ -775,6 +836,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
             return _eager("no target lm_head")
+
+        token_map_head = getattr(self, "_draft_token_map_head", None)
+        if token_map_head is not None:
+            tp_group = get_tp_group()
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH reduced-vocabulary head folded into the draft cuda "
+                    "graph (vocab=%d, tp=%d).",
+                    token_map_head.vocab_size,
+                    tp_group.world_size,
+                )
+            return _DflashDraftSampler(
+                weight=token_map_head.weight,
+                block_size=self.block_size,
+                num_org=token_map_head.weight.shape[0],
+                org_vocab_start=0,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                tp_group=tp_group if tp_group.world_size > 1 else None,
+                token_map_head=token_map_head,
+            )
 
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
@@ -1498,6 +1579,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        token_map_head = getattr(self, "_draft_token_map_head", None)
+        if token_map_head is not None:
+            return token_map_head.greedy(hidden_states, get_tp_group())
 
         if not is_dense_head_weight(getattr(lm_head, "weight", None)):
             return self._greedy_sample_from_quantized_head(

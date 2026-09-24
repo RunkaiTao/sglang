@@ -121,7 +121,10 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_token_map: A[
         Optional[str],
-        "The path of the draft model's small vocab table.",
+        "Path to the draft model's small vocab table. Standard DFLASH also "
+        "supports a non-empty 1D table of unique original token IDs, preserving "
+        "file order while target verification retains the full vocabulary. "
+        "EAGLE3 uses its checkpoint's built-in mapping instead.",
     ] = None
     speculative_attention_mode: A[
         str,
